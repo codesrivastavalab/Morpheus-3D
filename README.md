@@ -11,18 +11,8 @@ secondary-structure entropy, and scores both with a trained SVM classifier.
 An interactive web platform for exploring predictions is available at
 **[morpheus.slicearrow.com](https://morpheus.slicearrow.com/)**.
 
-![workflow](assets/workflow.png)
+![Morpheus-3D workflow](docs/workflow.png)
 
-Given a set of protein sequences, the pipeline:
-
-1. Queries a pre-built SQLite k-mer index for structural (3Di + secondary
-   structure) hits.
-2. Computes per-residue diversity features — 3Di Shannon entropy, SS
-   diversity, and SS entropy — cluster-weighted to avoid over-represented
-   structural clusters skewing the signal.
-3. Runs a trained SVM classifier on the summary features to predict
-   fold-switching status, and calls consensus fold-switch region(s) from
-   rolling-window hotspots.
 
 ## Database
 
@@ -57,6 +47,10 @@ Also needed: the SQLite index above, and a trained SVM pickle
 
 ## Usage
 
+`--input` accepts a single sequence or a batch — a FASTA file (`.fasta`)
+with any number of `>` entries. Each sequence is scored independently, and
+every stage's output has one row per input sequence.
+
 ```bash
 python pipeline.py \
     --input seqs.fasta \
@@ -75,7 +69,7 @@ K-mer length is fixed at 7 (matches the index). Other flags:
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--k_position` | 3 | 1-based position within the k-mer to analyse |
+| `--k_position` | 3 | Position within the k-mer to analyse |
 | `--plddt_cutoff` | 70.0 | Minimum per-residue pLDDT to keep a structural hit |
 | `--rolling_window` | 20 | Smoothing window for entropy curves and hotspot calling |
 | `--no_plots` | off | Skip per-protein figures |
@@ -141,7 +135,8 @@ Columns: `Max_Entropy_3di`, `Mean_Entropy_3di`, `Max_diversity`,
 max/mean of each metric across the protein).
 
 ### `predictions/all_predictions.xlsx`
-Every protein scored by the classifier, with:
+Every protein scored by the classifier — one row per input sequence,
+whether you ran on a single sequence or a multi-FASTA/XLSX batch. Columns:
 - `Prediction` — 0 (monomorphic) or 1 (predicted fold-switching)
 - `Probability` — classifier confidence
 - `Entropy_3di_roll20_hotspots`, `SS_Entropy_roll20_hotspots` — raw
@@ -151,58 +146,9 @@ Every protein scored by the classifier, with:
 - `FoldSwitch_Residues` — residue count spanned by the consensus region
 
 ### `predictions/positive_predictions.xlsx`
-Same columns as above, filtered to `Prediction == 1` — the fold-switch
-candidates.
+Same columns as above, filtered to `Prediction == 1` — just the proteins
+from the batch classified as fold-switching.
 
-## Database schema
-
-```sql
-CREATE TABLE kmers (
-    kmer_id INTEGER PRIMARY KEY,
-    kmer_aa TEXT
-);
-
-CREATE TABLE hits (
-    kmer_id     INTEGER REFERENCES kmers(kmer_id),
-    protein_id  TEXT,
-    cluster_id  TEXT,
-    ss_kmer     TEXT,
-    tdi_kmer    TEXT,
-    plddt_kmer  TEXT,
-    plddt_mean  REAL
-);
-```
-
-## Method notes
-
-- Hits weighted by `1 / cluster_size` to prevent large clusters dominating entropy.
-- Hits below `--plddt_cutoff` at the analysed position are excluded.
-- K-mer termini with no computed window are zero-padded in detail CSVs/plots
-  but excluded from `Max_/Mean_` summary features.
-- Fold-switch regions: rolling-averaged entropy/SS-entropy thresholded
-  (0.95 / 0.40, window 20) into hotspot runs; overlapping regions merged
-  into the consensus call, or the single metric used if only one fires.
 
 ## Citation
 
-If you use Morpheus-3D, please cite:
-
-> Kuniyil, S., Subramanian, V., Sekhar, A., Arun, A., Lakshmanan, A. &
-> Srivastava, A. Morpheus-3D: Structural Diversity-Guided Detection and
-> Localization of Protein Fold Switching. *bioRxiv* (2026).
-
-```bibtex
-@article{kuniyil2026morpheus3d,
-  title   = {Morpheus-3D: Structural Diversity-Guided Detection and
-             Localization of Protein Fold Switching},
-  author  = {Kuniyil, Sreeharsh and Subramanian, Vijay and Sekhar, Ashok
-             and Arun, Akanksha and Lakshmanan, Anand and
-             Srivastava, Anand},
-  journal = {bioRxiv},
-  year    = {2026}
-}
-```
-
-## License
-
-MIT
