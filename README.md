@@ -45,6 +45,12 @@ conda activate morpheus3d
 Also needed: the SQLite index above, and a trained SVM pickle
 (`svm_pipeline_model.pkl`) exposing `.predict()` / `.predict_proba()`.
 
+### Input requirements
+
+- Input sequences must be **longer than 25 amino acids** (minimum length: **26 residues**).
+- Only the **20 standard amino acids** (`A, C, D, E, F, G, H, I, K, L, M, N, P, Q, R, S, T, V, W, Y`) are supported.
+- Sequences containing non-standard or ambiguous amino acids (e.g., `B`, `J`, `O`, `U`, `X`, or `Z`) are not supported and should be removed before running Morpheus-3D.
+
 ## Usage
 
 `--input` accepts a single sequence or a batch — a FASTA file (`.fasta`)
