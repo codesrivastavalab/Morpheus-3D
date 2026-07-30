@@ -1,0 +1,14 @@
+name: morpheus3d
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+  - matplotlib
+  - openpyxl
+  - biopython
+  - pip
+  - scipy
+  - tqdm
+  - pandas=2.3.3
+  - numpy=1.26.4
+prefix: /home/user/miniconda3/envs/morpheus3d
