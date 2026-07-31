@@ -82,20 +82,7 @@ K-mer length is fixed at 7 (matches the index). Other flags:
 | `--workers` | 0 | Number of parallel worker processes to use (0 = use all available CPU cores) |
 | `--no_plots` | off | Skip per-protein figures |
 
-### Individual stages
 
-```bash
-python fragment_picker.py --input seqs.fasta --db kmer_indexed_db.sqlite --out fragment_hits/
-
-python diversity_profiler.py --hits_dir fragment_hits/ --out diversity_results/ \
-    --k_position 3 --plddt_cutoff 70 --rolling_window 20
-
-python predict_foldswitch.py \
-    --summary diversity_results/combined_diversity_summary.csv \
-    --detail_dir diversity_results/detail \
-    --model svm_pipeline_model.pkl \
-    --out predictions/
-```
 
 ## Output layout
 
