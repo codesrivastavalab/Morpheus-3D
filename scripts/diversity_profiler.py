@@ -23,11 +23,17 @@ Usage
   python diversity_profiler.py --hits_dir fragment_hits/ --out diversity_results/
   python diversity_profiler.py --hits_dir fragment_hits/ --out diversity_results/ \\
         --k_position 3 --plddt_cutoff 70 --rolling_window 20 --no_plots
+  python diversity_profiler.py --hits_dir fragment_hits/ --out diversity_results/ \\
+        --workers 8    # parallelize across proteins (default: all cores)
 """
 
 import argparse
+import math
+import os
+import time
 import warnings
 from collections import Counter
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import matplotlib
@@ -39,6 +45,12 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 import numpy as np
 import pandas as pd
+
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover - tqdm is a soft dependency here
+    def tqdm(iterable, **kwargs):
+        return iterable
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -288,10 +300,53 @@ def load_hits_file(path: Path) -> pd.DataFrame:
     return df
 
 
+def _compute_position_chunk(
+    chunk:        list[tuple],
+    k_idx:        int,
+    plddt_cutoff: float,
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """
+    Compute metric/prob/ss rows for one CHUNK of (K-mer Position, group)
+    pairs. This is the unit of work dispatched to a worker process when
+    parallelizing WITHIN a single protein (as opposed to across proteins) —
+    it's what actually keeps every core busy on a single very long
+    sequence, where per-file parallelism alone would have nothing to
+    split across.
+    """
+    metric_rows, prob_rows, ss_frac_rows = [], [], []
+    for pos, grp in chunk:
+        ent_3di, probs = compute_3di_entropy(grp, k_idx, plddt_cutoff)
+        ss             = compute_ss_features(grp, k_idx, plddt_cutoff)
+
+        residue_pos = int(pos) + k_idx   # 1-based position along full sequence
+
+        metric_rows.append({
+            "ResiduePosition": residue_pos,
+            "Entropy_3di":  round(ent_3di,         6),
+            "diversity":    round(ss["diversity"],  6),
+            "ss_entropy":   round(ss["ss_entropy"], 6),
+        })
+
+        prob_row = {"ResiduePosition": residue_pos}
+        prob_row.update({s: round(probs[s], 6) for s in STATES_3DI})
+        prob_rows.append(prob_row)
+
+        ss_frac_rows.append({
+            "ResiduePosition": residue_pos,
+            "H": round(ss["h_frac"], 6),
+            "E": round(ss["e_frac"], 6),
+            "L": round(ss["l_frac"], 6),
+        })
+
+    return metric_rows, prob_rows, ss_frac_rows
+
+
 def compute_profile(
     df:           pd.DataFrame,
     k_position:   int,
     plddt_cutoff: float,
+    executor:     "ProcessPoolExecutor | None" = None,
+    n_chunks:     int = 1,
 ) -> dict:
     """
     Per-residue diversity features, mapped onto the FULL protein length.
@@ -322,6 +377,14 @@ def compute_profile(
                      columns
       ss_fracs_df  — DataFrame (index=ResiduePosition, 1..n) with H, E, L
                      columns
+
+    `executor` / `n_chunks`: when an executor is passed and n_chunks > 1,
+    the per-K-mer-Position loop below (the actual computational cost, and
+    what dominates runtime for very long proteins) is split into n_chunks
+    pieces and farmed out across the pool instead of run in a single
+    process. This is what lets one huge protein use every core, not just
+    one — per-protein/per-file parallelism alone can't help when there's
+    only one (or few) protein(s) to spread across workers.
     """
     k_idx = k_position - 1
 
@@ -346,33 +409,26 @@ def compute_profile(
     max_kmer_pos = int(df["K-mer Position"].max())
     seq_len = max_kmer_pos + k - 1
 
+    groups = list(df.groupby("K-mer Position"))
+
     metric_rows  = []
     prob_rows    = []
     ss_frac_rows = []
 
-    for pos, grp in df.groupby("K-mer Position"):
-        ent_3di, probs = compute_3di_entropy(grp, k_idx, plddt_cutoff)
-        ss             = compute_ss_features(grp, k_idx, plddt_cutoff)
-
-        residue_pos = int(pos) + k_idx   # 1-based position along full sequence
-
-        metric_rows.append({
-            "ResiduePosition": residue_pos,
-            "Entropy_3di":  round(ent_3di,         6),
-            "diversity":    round(ss["diversity"],  6),
-            "ss_entropy":   round(ss["ss_entropy"], 6),
-        })
-
-        prob_row = {"ResiduePosition": residue_pos}
-        prob_row.update({s: round(probs[s], 6) for s in STATES_3DI})
-        prob_rows.append(prob_row)
-
-        ss_frac_rows.append({
-            "ResiduePosition": residue_pos,
-            "H": round(ss["h_frac"], 6),
-            "E": round(ss["e_frac"], 6),
-            "L": round(ss["l_frac"], 6),
-        })
+    if executor is not None and n_chunks > 1 and len(groups) > n_chunks:
+        chunk_size = max(1, math.ceil(len(groups) / n_chunks))
+        chunks = [groups[i:i + chunk_size] for i in range(0, len(groups), chunk_size)]
+        for m, p, s in executor.map(
+            _compute_position_chunk, chunks,
+            [k_idx] * len(chunks), [plddt_cutoff] * len(chunks),
+        ):
+            metric_rows.extend(m)
+            prob_rows.extend(p)
+            ss_frac_rows.extend(s)
+    else:
+        metric_rows, prob_rows, ss_frac_rows = _compute_position_chunk(
+            groups, k_idx, plddt_cutoff
+        )
 
     full_index = pd.RangeIndex(1, seq_len + 1, name="ResiduePosition")
 
@@ -661,7 +717,150 @@ def plot_protein(
     )
 
 
+# ── Per-protein worker (runs inside a pool process) ──────────────────────────
+# This is exactly the body that used to live inline in process_all()'s for-loop.
+# Pulling it out to module level is what makes it picklable/dispatchable to a
+# ProcessPoolExecutor — each worker computes one protein's full profile
+# (feature extraction + plotting are both CPU-bound, so this is where the
+# multi-core speedup actually comes from) and writes its own files straight
+# to disk. Only the small summary-row dict is shipped back to the main
+# process, never the big per-residue DataFrames.
+
+def _process_one_protein(
+    fp:             Path,
+    detail_dir:     Path,
+    plots_dir:      Path,
+    k_position:     int,
+    plddt_cutoff:   float,
+    rolling_window: int,
+    do_plots:       bool,
+) -> tuple[str, dict | None, str | None]:
+    """
+    Returns (name, record_or_None, error_or_None).
+      - record is the {"Protein": ..., "Max_..."/"Mean_..."} summary row.
+      - record is None (with a status string) if the protein was skipped
+        (no usable data) or errored out — either way the batch continues.
+    """
+    name = fp.stem
+    if name.endswith("_hits"):
+        name = name[:-5]
+
+    try:
+        df      = load_hits_file(fp)
+        profile = compute_profile(df, k_position, plddt_cutoff)
+        metrics       = profile["metrics_df"]        # full length, zero-padded
+        metrics_valid = profile["metrics_df_valid"]  # only computed residues
+
+        if metrics.empty:
+            return name, None, "no usable data"
+
+        # Edge-safe rolling profile for structure-based colouring
+        # (e.g. blue-white-red per-residue mapping): rolled with
+        # min_periods=1 on the valid-only data, so the first/last
+        # ~(rolling_window/2) real residues are smoothed with fewer
+        # neighbours instead of coming back NaN, and the smoothing
+        # is never contaminated by the zero-padded k-mer termini.
+        # Residues with no computed window at all stay 0.
+        roll_valid = pd.DataFrame(index=metrics_valid.index)
+        for col in ["Entropy_3di", "ss_entropy"]:
+            roll_valid[f"{col}_roll{rolling_window}"] = rolling_avg(
+                metrics_valid[col], rolling_window, min_periods=1
+            )
+        roll_full = roll_valid.reindex(metrics.index, fill_value=0.0)
+        metrics = metrics.join(roll_full)
+
+        # Save per-protein detail tables (full-length, residue-indexed)
+        metrics.to_csv(detail_dir / f"{name}_metrics.csv")
+        profile["probs_3di_df"].to_csv(detail_dir / f"{name}_3di_probs.csv")
+        profile["ss_fracs_df"].to_csv(detail_dir / f"{name}_ss_fracs.csv")
+
+        if do_plots:
+            plot_protein(profile, name, plots_dir, rolling_window)
+
+        # Rolling Max_/Mean_ summary features: computed on metrics_valid
+        # only (no zero-padded termini), matching the original
+        # window-only behaviour.
+        rec = {"Protein": name}
+        for col in METRIC_COLS:
+            r = metrics_valid[col].rolling(
+                window=rolling_window, center=True
+            ).mean().dropna()
+            rec[f"Max_{col}"]  = round(float(r.max()),  5) if len(r) else float("nan")
+            rec[f"Mean_{col}"] = round(float(r.mean()), 5) if len(r) else float("nan")
+
+        return name, rec, None
+
+    except Exception as exc:  # noqa: BLE001 — surfaced to the main process, not swallowed
+        return name, None, str(exc)
+
+
+def _plot_protein_task(
+    profile:        dict,
+    name:           str,
+    plots_dir:      Path,
+    rolling_window: int,
+) -> str:
+    """Thin picklable wrapper so plotting can be submitted to a pool as its own task."""
+    plot_protein(profile, name, plots_dir, rolling_window)
+    return name
+
+
+def _finish_protein(
+    name:           str,
+    profile:        dict,
+    detail_dir:     Path,
+    rolling_window: int,
+) -> dict | None:
+    """
+    Shared tail-end logic (rolling-smoothed columns, detail CSVs, summary
+    row) used by BOTH parallelization strategies below, so the two code
+    paths can't silently drift apart. Returns the summary record, or None
+    if the protein had no usable data.
+    """
+    metrics       = profile["metrics_df"]
+    metrics_valid = profile["metrics_df_valid"]
+
+    if metrics.empty:
+        return None
+
+    roll_valid = pd.DataFrame(index=metrics_valid.index)
+    for col in ["Entropy_3di", "ss_entropy"]:
+        roll_valid[f"{col}_roll{rolling_window}"] = rolling_avg(
+            metrics_valid[col], rolling_window, min_periods=1
+        )
+    roll_full = roll_valid.reindex(metrics.index, fill_value=0.0)
+    metrics = metrics.join(roll_full)
+
+    metrics.to_csv(detail_dir / f"{name}_metrics.csv")
+    profile["probs_3di_df"].to_csv(detail_dir / f"{name}_3di_probs.csv")
+    profile["ss_fracs_df"].to_csv(detail_dir / f"{name}_ss_fracs.csv")
+
+    rec = {"Protein": name}
+    for col in METRIC_COLS:
+        r = metrics_valid[col].rolling(
+            window=rolling_window, center=True
+        ).mean().dropna()
+        rec[f"Max_{col}"]  = round(float(r.max()),  5) if len(r) else float("nan")
+        rec[f"Mean_{col}"] = round(float(r.mean()), 5) if len(r) else float("nan")
+    return rec
+
+
 # ── Dataset loop ──────────────────────────────────────────────────────────────
+#
+# Two parallelization strategies, chosen automatically based on how many
+# protein hit-files there are relative to worker count:
+#
+#  (A) MANY files, >= workers  -> parallelize ACROSS proteins (one whole
+#      protein per worker). Simple, low overhead, great when you have a
+#      batch of many proteins.
+#
+#  (B) FEW files, < workers    -> parallelize WITHIN each protein, across
+#      its k-mer positions, using a single shared pool. This is the path
+#      that matters for e.g. one 1800-residue protein: strategy (A) would
+#      only ever occupy ONE core for it, no matter how many workers you
+#      pass, because there's only one task to hand out. Plot rendering is
+#      also dispatched to the same pool asynchronously so it overlaps with
+#      the next protein's computation instead of blocking on it.
 
 def process_all(
     hits_dir:       Path,
@@ -670,11 +869,13 @@ def process_all(
     plddt_cutoff:   float,
     rolling_window: int,
     do_plots:       bool,
+    workers:        int = 1,
 ) -> pd.DataFrame:
     """
     Iterate over every hit file in `hits_dir`, compute per-residue profiles
     and summary features, optionally generate plots, and write out the
-    combined summary CSV.
+    combined summary CSV. See module notes above `process_all` for how
+    `workers` gets applied depending on file count vs. worker count.
     """
 
     plots_dir  = out_dir / "plots"
@@ -690,64 +891,90 @@ def process_all(
         raise FileNotFoundError(f"No CSV / XLSX files found in: {hits_dir}")
 
     print(f"\nFound {len(hit_files)} hit file(s) in {hits_dir}")
+    print(f"Workers: {workers}")
 
     records = []
-    n = len(hit_files)
+    errors  = []
+    t0 = time.time()
 
-    for i, fp in enumerate(hit_files, 1):
-        name = fp.stem
-        if name.endswith("_hits"):
-            name = name[:-5]
+    if workers <= 1:
+        # Sequential fallback — same code path, just called in-process.
+        for fp in tqdm(hit_files, desc="Processing proteins"):
+            name, rec, err = _process_one_protein(
+                fp, detail_dir, plots_dir,
+                k_position, plddt_cutoff, rolling_window, do_plots,
+            )
+            if rec is not None:
+                records.append(rec)
+            elif err:
+                errors.append((name, err))
 
-        print(f"  [{i:>3}/{n}]  {name}")
-        try:
-            df      = load_hits_file(fp)
-            profile = compute_profile(df, k_position, plddt_cutoff)
-            metrics       = profile["metrics_df"]        # full length, zero-padded
-            metrics_valid = profile["metrics_df_valid"]  # only computed residues
+    elif len(hit_files) >= workers:
+        # Strategy (A): parallel across proteins — enough files to keep
+        # every worker busy with a whole protein each.
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(
+                    _process_one_protein,
+                    fp, detail_dir, plots_dir,
+                    k_position, plddt_cutoff, rolling_window, do_plots,
+                ): fp
+                for fp in hit_files
+            }
+            for fut in tqdm(
+                as_completed(futures), total=len(futures), desc="Processing proteins"
+            ):
+                name, rec, err = fut.result()
+                if rec is not None:
+                    records.append(rec)
+                elif err:
+                    errors.append((name, err))
 
-            if metrics.empty:
-                print(f"    SKIPPED — no usable data")
-                continue
+    else:
+        # Strategy (B): fewer files than workers (the common case for one
+        # or a handful of very long proteins) — parallelize WITHIN each
+        # protein instead, across a single shared pool.
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            pending_plots = []
 
-            # Edge-safe rolling profile for structure-based colouring
-            # (e.g. blue-white-red per-residue mapping): rolled with
-            # min_periods=1 on the valid-only data, so the first/last
-            # ~(rolling_window/2) real residues are smoothed with fewer
-            # neighbours instead of coming back NaN, and the smoothing
-            # is never contaminated by the zero-padded k-mer termini.
-            # Residues with no computed window at all stay 0.
-            roll_valid = pd.DataFrame(index=metrics_valid.index)
-            for col in ["Entropy_3di", "ss_entropy"]:
-                roll_valid[f"{col}_roll{rolling_window}"] = rolling_avg(
-                    metrics_valid[col], rolling_window, min_periods=1
-                )
-            roll_full = roll_valid.reindex(metrics.index, fill_value=0.0)
-            metrics = metrics.join(roll_full)
+            for fp in tqdm(hit_files, desc="Processing proteins"):
+                name = fp.stem
+                if name.endswith("_hits"):
+                    name = name[:-5]
+                try:
+                    df = load_hits_file(fp)
+                    profile = compute_profile(
+                        df, k_position, plddt_cutoff,
+                        executor=pool, n_chunks=workers,
+                    )
+                    rec = _finish_protein(name, profile, detail_dir, rolling_window)
+                    if rec is None:
+                        errors.append((name, "no usable data"))
+                        continue
+                    records.append(rec)
 
-            # Save per-protein detail tables (full-length, residue-indexed)
-            metrics.to_csv(detail_dir / f"{name}_metrics.csv")
-            profile["probs_3di_df"].to_csv(detail_dir / f"{name}_3di_probs.csv")
-            profile["ss_fracs_df"].to_csv(detail_dir / f"{name}_ss_fracs.csv")
+                    if do_plots:
+                        pending_plots.append((
+                            name,
+                            pool.submit(_plot_protein_task, profile, name, plots_dir, rolling_window),
+                        ))
+                except Exception as exc:
+                    errors.append((name, str(exc)))
 
-            if do_plots:
-                plot_protein(profile, name, plots_dir, rolling_window)
+            if pending_plots:
+                print(f"\nWaiting for {len(pending_plots)} plot(s) to finish rendering...")
+                for name, fut in tqdm(pending_plots, desc="Rendering plots"):
+                    try:
+                        fut.result()
+                    except Exception as exc:
+                        errors.append((f"{name} (plot)", str(exc)))
 
-            # Rolling Max_/Mean_ summary features: computed on metrics_valid
-            # only (no zero-padded termini), matching the original
-            # window-only behaviour.
-            rec = {"Protein": name}
-            for col in METRIC_COLS:
-                r = metrics_valid[col].rolling(
-                    window=rolling_window, center=True
-                ).mean().dropna()
-                rec[f"Max_{col}"]  = round(float(r.max()),  5) if len(r) else float("nan")
-                rec[f"Mean_{col}"] = round(float(r.mean()), 5) if len(r) else float("nan")
-
-            records.append(rec)
-
-        except Exception as exc:
-            print(f"    SKIPPED — {exc}")
+    elapsed = time.time() - t0
+    print(f"\nProcessed {len(hit_files)} protein(s) in {elapsed:.1f}s.")
+    if errors:
+        print(f"  {len(errors)} skipped/errored:")
+        for name, err in errors:
+            print(f"    - {name}: {err}")
 
     if not records:
         print("\nNo proteins processed successfully.")
@@ -784,6 +1011,10 @@ def main() -> None:
                         help="Smoothing window width (k-mer positions)")
     parser.add_argument("--no_plots", action="store_true",
                         help="Skip per-protein plots")
+    parser.add_argument("--workers", type=int, default=os.cpu_count(),
+                        help="Number of parallel worker processes "
+                             "(default: all available CPU cores; use 1 "
+                             "for the old sequential behaviour)")
     args = parser.parse_args()
 
     out_dir = Path(args.out)
@@ -801,6 +1032,7 @@ def main() -> None:
         plddt_cutoff   = args.plddt_cutoff,
         rolling_window = args.rolling_window,
         do_plots       = not args.no_plots,
+        workers        = max(1, args.workers),
     )
 
     if not summary.empty:

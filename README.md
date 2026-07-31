@@ -29,7 +29,7 @@ Download `Morpheus3D_database_sqlite.zip` and unzip it to get
 | `fragment_picker.py` | K-mer window query against the SQLite index. Writes one `*_hits.csv` per sequence. |
 | `diversity_profiler.py` | Per-residue entropy/diversity features, detail CSVs, summary CSV, and optional per-protein figure. |
 | `predict_foldswitch.py` | SVM classification + consensus fold-switch region calling. |
-| `pipeline.py` | Runs all three stages end-to-end. |
+| `pipeline.py` | Runs fragment retrieval, structural diversity profiling, and fold-switch prediction end-to-end with optional multi-core parallel processing. |
 
 ## Requirements
 
@@ -40,16 +40,15 @@ conda env create -f environment.yml
 conda activate morpheus3d
 ```
 
-(Or, if you'd rather manage it yourself: `pip install pandas numpy matplotlib scikit-learn joblib tqdm openpyxl`.)
+(Or: `pip install pandas numpy matplotlib scikit-learn joblib tqdm openpyxl`.)
 
-Also needed: the SQLite index above, and a trained SVM pickle
-(`svm_pipeline_model.pkl`) exposing `.predict()` / `.predict_proba()`.
 
 ### Input requirements
 
-- Input sequences must be **longer than 25 amino acids** (minimum length: **26 residues**).
+- Input sequences must be at least **26 amino acids** long.
+- During batch processing, sequences shorter than **26 residues** are automatically skipped while valid sequences continue processing. If all input sequences are shorter than 26 residues, the pipeline exits with a clear error message.
 - Only the **20 standard amino acids** (`A, C, D, E, F, G, H, I, K, L, M, N, P, Q, R, S, T, V, W, Y`) are supported.
-- Sequences containing non-standard or ambiguous amino acids (e.g., `B`, `J`, `O`, `U`, `X`, or `Z`) are not supported and should be removed before running Morpheus-3D.
+- Sequences containing ambiguous or non-standard amino acids (`B`, `J`, `O`, `U`, `X`, or `Z`) are not supported.
 
 ## Usage
 
@@ -62,6 +61,7 @@ python pipeline.py \
     --input seqs.fasta \
     --db kmer_indexed_db.sqlite \
     --model svm_pipeline_model.pkl \
+    --workers 0 \
     --out results/
 ```
 
@@ -71,6 +71,7 @@ Skip classification:
 python pipeline.py --input seqs.fasta --db kmer_indexed_db.sqlite --skip_prediction
 ```
 
+
 K-mer length is fixed at 7 (matches the index). Other flags:
 
 | Flag | Default | Meaning |
@@ -78,6 +79,7 @@ K-mer length is fixed at 7 (matches the index). Other flags:
 | `--k_position` | 3 | Position within the k-mer to analyse |
 | `--plddt_cutoff` | 70.0 | Minimum per-residue pLDDT to keep a structural hit |
 | `--rolling_window` | 20 | Smoothing window for entropy curves and hotspot calling |
+| `--workers` | 0 | Number of parallel worker processes to use (0 = use all available CPU cores) |
 | `--no_plots` | off | Skip per-protein figures |
 
 ### Individual stages

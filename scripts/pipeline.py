@@ -38,10 +38,13 @@ Usage
         --k_position 3 --plddt_cutoff 70 --rolling_window 20 \\
         --model /path/to/svm_pipeline_model.pkl \\
         --out results/ --no_plots
+  python pipeline.py --input seqs.fasta --db kmer_index.sqlite \\
+        --model /path/to/svm_pipeline_model.pkl --workers 8
   python pipeline.py --input seqs.fasta --db kmer_index.sqlite --skip_prediction
 """
 
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -123,6 +126,14 @@ def main() -> None:
         help="Skip per-protein diversity plots",
     )
 
+    # ── Parallelism ───────────────────────────────────────────────────────────
+    parser.add_argument(
+        "--workers", type=int, default=0,
+        help="Number of parallel worker processes to use for BOTH "
+             "fragment_picker.py and diversity_profiler.py "
+             "(0 = use all available CPU cores)",
+    )
+
     # ── predict_foldswitch knobs ──────────────────────────────────────────────
     parser.add_argument(
         "--model",
@@ -164,6 +175,14 @@ def main() -> None:
 
     model_path = Path(args.model).resolve() if not args.skip_prediction else None
 
+    # Resolve "0 = all cores" to an actual integer ONCE, here, and pass that
+    # same resolved value to every sub-script. fragment_picker.py already
+    # understands 0 as "use all cores", but diversity_profiler.py does not
+    # apply that convention to its own --workers flag (it just clamps to
+    # max(1, workers)), so forwarding a raw 0 to it silently pinned it to a
+    # single worker regardless of how many cores were actually available.
+    n_workers = args.workers if args.workers > 0 else (os.cpu_count() or 1)
+
     # ── Pre-flight checks ────────────────────────────────────────────────────
     # Fail fast with a readable summary rather than letting a missing file
     # blow up halfway through a multi-step subprocess chain.
@@ -198,6 +217,8 @@ def main() -> None:
     print(f"  K position     : {args.k_position}")
     print(f"  pLDDT cutoff   : {args.plddt_cutoff}")
     print(f"  Rolling window : {args.rolling_window}")
+    print(f"  Workers        : {n_workers}"
+          f"{'  (all cores)' if args.workers == 0 else ''}")
     print(f"  Plots          : {'no' if args.no_plots else 'yes'}")
     print(f"  Prediction     : {'skipped' if args.skip_prediction else 'yes'}")
     if not args.skip_prediction:
@@ -208,9 +229,10 @@ def main() -> None:
     # ── Step 1: fragment_picker.py ───────────────────────────────────────────
     picker_cmd = [
         sys.executable, str(picker_script),
-        "--input", str(input_path),
-        "--db",    str(db_path),
-        "--out",   str(hits_dir),
+        "--input",   str(input_path),
+        "--db",      str(db_path),
+        "--out",     str(hits_dir),
+        "--workers", str(n_workers),
     ]
     run(picker_cmd, "fragment_picker.py  (k-mer database query)")
 
@@ -222,6 +244,7 @@ def main() -> None:
         "--k_position",     str(args.k_position),
         "--plddt_cutoff",   str(args.plddt_cutoff),
         "--rolling_window", str(args.rolling_window),
+        "--workers",        str(n_workers),
     ]
     if args.no_plots:
         profiler_cmd.append("--no_plots")
