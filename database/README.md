@@ -10,12 +10,12 @@ Extract `Morpheus3D_database_sqlite.zip` and place the contents in this director
 
 ```
 database/
-├── Morpheus3D_database_sqlite
+├── Morpheus3D_database.sqlite
 └── ...
 ```
 
 Then run Morpheus-3D with:
 
 ```bash
---db database/Morpheus3D_database_sqlite
+--db database/Morpheus3D_database.sqlite
 ```
