@@ -10,12 +10,12 @@ Extract `Morpheus3D_database_sqlite.zip` and place the contents in this director
 
 ```
 database/
-├── kmer_indexed_db.sqlite
+├── Morpheus3D_database_sqlite
 └── ...
 ```
 
 Then run Morpheus-3D with:
 
 ```bash
---db database/kmer_indexed_db.sqlite
+--db database/Morpheus3D_database_sqlite
 ```
