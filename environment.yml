@@ -11,4 +11,6 @@ dependencies:
   - tqdm
   - pandas=2.3.3
   - numpy=1.26.4
-prefix: /home/user/miniconda3/envs/morpheus3d
+  - pip:
+      - joblib
+      - scikit-learn
