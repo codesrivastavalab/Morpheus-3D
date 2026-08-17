@@ -20,7 +20,7 @@ The SQLite k-mer index and sequence database are hosted on Hugging Face:
 **[sreeharshk/Morpheus3D-Database](https://huggingface.co/datasets/sreeharshk/Morpheus3D-Database)**
 
 Download `Morpheus3D_database_sqlite.zip` and unzip it to get
-`kmer_indexed_db.sqlite`, the `--db` argument used below.
+`Morpheus3D_database.sqlite`, the `--db` argument used below.
 
 ## Scripts
 
@@ -59,7 +59,7 @@ every stage's output has one row per input sequence.
 ```bash
 python pipeline.py \
     --input seqs.fasta \
-    --db kmer_indexed_db.sqlite \
+    --db Morpheus3D_database.sqlite \
     --model svm_pipeline_model.pkl \
     --workers 0 \
     --out results/
@@ -68,7 +68,7 @@ python pipeline.py \
 Skip classification:
 
 ```bash
-python pipeline.py --input seqs.fasta --db kmer_indexed_db.sqlite --skip_prediction
+python pipeline.py --input seqs.fasta --db Morpheus3D_database.sqlite --skip_prediction
 ```
 
 
