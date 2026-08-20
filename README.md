@@ -146,4 +146,6 @@ from the batch classified as fold-switching.
 
 
 ## Citation
+If you use Morpheus-3D, please cite:
 
+Sreeharsh Kuniyil, Vijay Subramanian, Akanksha Arun, Anand Lakshmanan, Ashok Sekhar, Anand Srivastava. **Morpheus-3D: Structural Diversity-Guided Detection and Localization of Protein Fold Switching.** bioRxiv (2026). https://doi.org/10.64898/2026.08.16.745091
